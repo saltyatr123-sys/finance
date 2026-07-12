@@ -111,30 +111,38 @@ function detectColorHint(text) {
   return null
 }
 
-async function updateInventoryOnSale(text, amount, qty) {
+async function findInventoryProduct(text) {
   const productType = detectProductType(text)
-  const size = detectSize(text)
-  if (!productType || !size) return null
+  if (!productType) return { product: null, size: null }
 
+  const size = detectSize(text)
   const colorHint = detectColorHint(text)
   const items = await fsGet('inventory')
 
-  // Find best matching product
   let candidates = items.filter((item) => item.name && item.name.includes(productType))
   if (colorHint) {
     const withColor = candidates.filter((item) => item.color && item.color.includes(colorHint))
     if (withColor.length) candidates = withColor
   }
-  if (!candidates.length) return null
+  if (!candidates.length) return { product: null, size }
 
-  // Prefer product with stock in that size
-  const withStock = candidates.filter((item) => {
-    try {
-      const sizes = JSON.parse(item.sizes || '[]')
-      return sizes.some((s) => s.size === size && s.stock > 0)
-    } catch { return false }
-  })
-  const product = withStock.length ? withStock[0] : candidates[0]
+  // Prefer product with stock in that size (for sales)
+  if (size) {
+    const withStock = candidates.filter((item) => {
+      try {
+        const sizes = JSON.parse(item.sizes || '[]')
+        return sizes.some((s) => s.size === size && s.stock > 0)
+      } catch { return false }
+    })
+    return { product: withStock.length ? withStock[0] : candidates[0], size }
+  }
+
+  return { product: candidates[0], size: null }
+}
+
+async function updateInventoryOnSale(text, amount, qty) {
+  const { product, size } = await findInventoryProduct(text)
+  if (!product || !size) return null
 
   let sizes
   try { sizes = JSON.parse(product.sizes || '[]') } catch { return null }
@@ -147,11 +155,24 @@ async function updateInventoryOnSale(text, amount, qty) {
 
   await fsPatch('inventory', product._id, { sizes: JSON.stringify(sizes) })
 
-  return {
-    name: product.name,
-    size,
-    newStock: sizes[sizeIdx].stock,
-  }
+  return { name: product.name, size, newStock: sizes[sizeIdx].stock }
+}
+
+async function updateInventoryOnPurchase(text, qty) {
+  const { product, size } = await findInventoryProduct(text)
+  if (!product || !size) return null
+
+  let sizes
+  try { sizes = JSON.parse(product.sizes || '[]') } catch { return null }
+
+  const sizeIdx = sizes.findIndex((s) => s.size === size)
+  if (sizeIdx === -1) return null
+
+  sizes[sizeIdx].stock += qty
+
+  await fsPatch('inventory', product._id, { sizes: JSON.stringify(sizes) })
+
+  return { name: product.name, size, newStock: sizes[sizeIdx].stock }
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -255,13 +276,26 @@ async function processMessage(text) {
       : /משלוח/.test(t) ? 'משלוחים'
       : 'אחר'
 
+    const qty = extractQuantity(t)
+
     await fsAdd('expenses', {
       amount,
       description: t,
       date,
       category,
     })
-    return `✅ *נרשמה הוצאה*\n₪${amount.toLocaleString()} — ${date}\nקטגוריה: ${category}\n"${t}"`
+
+    let reply = `✅ *נרשמה הוצאה*\n₪${amount.toLocaleString()} — ${date}\nקטגוריה: ${category}\n"${t}"`
+
+    // If it's an inventory purchase, update stock
+    if (category === 'רכישת מלאי') {
+      const invUpdate = await updateInventoryOnPurchase(t, qty)
+      if (invUpdate) {
+        reply += `\n\n📦 *מלאי עודכן:*\n${invUpdate.name} ${invUpdate.size} → נשארו ${invUpdate.newStock} יח'`
+      }
+    }
+
+    return reply
   }
 }
 
