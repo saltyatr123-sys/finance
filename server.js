@@ -316,6 +316,39 @@ app.post('/whatsapp', async (req, res) => {
   res.type('text/xml').send(twiml.toString())
 })
 
+// ── Shopify webhook ───────────────────────────────────────────────────────────
+app.post('/shopify-order', async (req, res) => {
+  res.sendStatus(200) // respond immediately so Shopify doesn't retry
+
+  try {
+    const order = req.body
+    if (!order || !order.total_price) return
+
+    const amount = parseFloat(order.total_price)
+    if (!amount) return
+
+    const orderNumber = order.order_number || order.name || 'ללא מספר'
+    const items = (order.line_items || [])
+      .map((i) => `${i.name} x${i.quantity}`)
+      .join(', ')
+    const description = `הזמנה #${orderNumber}${items ? ' — ' + items : ''}`
+
+    const date = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Jerusalem' }).slice(0, 10)
+
+    await fsAdd('income', {
+      amount,
+      description,
+      date,
+      category: 'מכירת מוצרים',
+      source: 'shopify',
+    })
+
+    console.log(`Shopify order logged: #${orderNumber} ₪${amount}`)
+  } catch (err) {
+    console.error('Shopify webhook error:', err)
+  }
+})
+
 app.get('/', (_, res) => res.send('Salty Bot is running 🧂'))
 
 const PORT = process.env.PORT || 3001
