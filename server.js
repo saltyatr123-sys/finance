@@ -33,7 +33,7 @@ async function fsGet(col) {
   const res = await fetch(`${FIRESTORE_BASE}/${col}?key=${FIREBASE_API_KEY}`)
   const json = await res.json()
   return (json.documents || []).map((d) => {
-    const out = {}
+    const out = { _id: d.name.split('/').pop() }
     for (const [k, v] of Object.entries(d.fields || {})) {
       out[k] = v.doubleValue ?? v.stringValue ?? v.integerValue ?? null
     }
@@ -41,10 +41,32 @@ async function fsGet(col) {
   })
 }
 
+async function fsPatch(col, docId, data) {
+  const fields = Object.keys(data).map((k) => `updateMask.fieldPaths=${k}`).join('&')
+  const res = await fetch(
+    `${FIRESTORE_BASE}/${col}/${docId}?key=${FIREBASE_API_KEY}&${fields}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: toFirestoreFields(data) }),
+    }
+  )
+  return res.json()
+}
+
 // ── Message parser ────────────────────────────────────────────────────────────
+
+// Returns the LAST number (most likely the price, not quantity)
 function extractAmount(text) {
-  const match = text.match(/\d+(\.\d+)?/)
-  return match ? parseFloat(match[0]) : null
+  const matches = [...text.matchAll(/\d+(\.\d+)?/g)]
+  if (!matches.length) return null
+  return parseFloat(matches[matches.length - 1][0])
+}
+
+// Returns the FIRST number if there are 2+ numbers (likely quantity)
+function extractQuantity(text) {
+  const matches = [...text.matchAll(/\d+/g)]
+  return matches.length >= 2 ? parseInt(matches[0][0]) : 1
 }
 
 function today() {
@@ -59,9 +81,8 @@ const EXPENSE_WORDS = ['שילמתי', 'קניתי', 'הוצאה', 'תשלום',
 const INCOME_WORDS  = ['מכרתי', 'קיבלתי', 'הכנסה', 'מכירה', 'נכנס', 'נכנסו', 'מכר']
 
 function detectType(text) {
-  const t = text
-  if (EXPENSE_WORDS.some((w) => t.includes(w))) return 'expense'
-  if (INCOME_WORDS.some((w) => t.includes(w)))  return 'income'
+  if (EXPENSE_WORDS.some((w) => text.includes(w))) return 'expense'
+  if (INCOME_WORDS.some((w) => text.includes(w)))  return 'income'
   return null
 }
 
@@ -69,6 +90,68 @@ function detectSource(text) {
   if (/שופיפ/.test(text)) return 'shopify'
   if (/פופ.?אפ|popup/.test(text)) return 'popup'
   return 'other'
+}
+
+// ── Inventory matching ────────────────────────────────────────────────────────
+function detectProductType(text) {
+  if (/חולצ/.test(text)) return 'חולצ'
+  if (/סוודר|סווד/.test(text)) return 'סוודר'
+  return null
+}
+
+function detectSize(text) {
+  const match = text.match(/\b(XXL|XL|XS|XXS|S|M|L)\b/i)
+  return match ? match[1].toUpperCase() : null
+}
+
+function detectColorHint(text) {
+  if (/נייבי|נייווי/.test(text)) return 'נייבי'
+  if (/חום/.test(text)) return 'חום'
+  if (/קהה/.test(text)) return 'קהה'
+  return null
+}
+
+async function updateInventoryOnSale(text, amount, qty) {
+  const productType = detectProductType(text)
+  const size = detectSize(text)
+  if (!productType || !size) return null
+
+  const colorHint = detectColorHint(text)
+  const items = await fsGet('inventory')
+
+  // Find best matching product
+  let candidates = items.filter((item) => item.name && item.name.includes(productType))
+  if (colorHint) {
+    const withColor = candidates.filter((item) => item.color && item.color.includes(colorHint))
+    if (withColor.length) candidates = withColor
+  }
+  if (!candidates.length) return null
+
+  // Prefer product with stock in that size
+  const withStock = candidates.filter((item) => {
+    try {
+      const sizes = JSON.parse(item.sizes || '[]')
+      return sizes.some((s) => s.size === size && s.stock > 0)
+    } catch { return false }
+  })
+  const product = withStock.length ? withStock[0] : candidates[0]
+
+  let sizes
+  try { sizes = JSON.parse(product.sizes || '[]') } catch { return null }
+
+  const sizeIdx = sizes.findIndex((s) => s.size === size)
+  if (sizeIdx === -1) return null
+
+  sizes[sizeIdx].sellPrice = amount
+  sizes[sizeIdx].stock = Math.max(0, sizes[sizeIdx].stock - qty)
+
+  await fsPatch('inventory', product._id, { sizes: JSON.stringify(sizes) })
+
+  return {
+    name: product.name,
+    size,
+    newStock: sizes[sizeIdx].stock,
+  }
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -81,7 +164,8 @@ async function cmdInventory() {
     let sizes
     try { sizes = JSON.parse(item.sizes) } catch { continue }
     const lines = sizes.map((s) => `${s.size}: ${s.stock} יח'`).join(' | ')
-    msg += `*${item.name}*\n${lines}\n\n`
+    const totalStock = sizes.reduce((sum, s) => sum + s.stock, 0)
+    msg += `*${item.name}*\n${lines}\nסה"כ: ${totalStock} יח'\n\n`
   }
   return msg.trim()
 }
@@ -108,7 +192,8 @@ async function cmdReport() {
 function cmdHelp() {
   return (
     `🧂 *Salty Bot — פקודות:*\n\n` +
-    `*הכנסה:*\n"מכרתי חולצה M 150"\n"קיבלתי 200 פופאפ"\n\n` +
+    `*הכנסה:*\n"מכרתי חולצה M 150"\n"מכרתי סוודר L 200"\n"קיבלתי 200 פופאפ"\n\n` +
+    `*כמות:*\n"מכרתי 2 חולצות M 150" (2 יחידות)\n\n` +
     `*הוצאה:*\n"שילמתי שופיפי 90"\n"קניתי מלאי 500"\n\n` +
     `*פקודות מהירות:*\n📦 *מלאי* — סיכום מלאי\n📊 *דוח* — סיכום החודש\n❓ *עזרה* — ההודעה הזו`
   )
@@ -139,15 +224,28 @@ async function processMessage(text) {
 
   if (type === 'income') {
     const source = detectSource(t)
+    const qty = extractQuantity(t)
+
     await fsAdd('income', {
-      amount,
+      amount: amount * qty,
       description: t,
       date,
       category: 'מכירת מוצרים',
       source,
     })
+
     const sourceLabel = source === 'shopify' ? ' (שופיפי)' : source === 'popup' ? ' (פופאפ)' : ''
-    return `✅ *נרשמה הכנסה${sourceLabel}*\n₪${amount.toLocaleString()} — ${date}\n"${t}"`
+    let reply = `✅ *נרשמה הכנסה${sourceLabel}*\n₪${(amount * qty).toLocaleString()} — ${date}`
+    if (qty > 1) reply += ` (${qty} יח' × ₪${amount})`
+    reply += `\n"${t}"`
+
+    // Update inventory: set sellPrice + decrease stock
+    const invUpdate = await updateInventoryOnSale(t, amount, qty)
+    if (invUpdate) {
+      reply += `\n\n📦 *מלאי עודכן:*\n${invUpdate.name} ${invUpdate.size} → נשארו ${invUpdate.newStock} יח'`
+    }
+
+    return reply
   }
 
   if (type === 'expense') {
