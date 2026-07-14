@@ -95,13 +95,20 @@ function detectSource(text) {
 // ── Inventory matching ────────────────────────────────────────────────────────
 function detectProductType(text) {
   if (/חולצ/.test(text)) return 'חולצ'
-  if (/סוודר|סווד/.test(text)) return 'סוודר'
+  if (/סוודר|סווד|פוטר/.test(text)) return 'פוטר'
+  if (/מכנס/.test(text)) return 'מכנס'
   return null
 }
 
 function detectSize(text) {
   const match = text.match(/\b(XXL|XL|XS|XXS|S|M|L)\b/i)
   return match ? match[1].toUpperCase() : null
+}
+
+function extractBuyer(text) {
+  // "מכרתי חולצה M לכרמל 150" → "כרמל"
+  const match = text.match(/ל([א-ת]{2,10})(?:\s|$)/)
+  return match ? match[1] : ''
 }
 
 function detectColorHint(text) {
@@ -195,7 +202,7 @@ async function cmdReport() {
   const month = thisMonth()
   const [incomes, expenses] = await Promise.all([fsGet('income'), fsGet('expenses')])
 
-  const monthIncome   = incomes.filter((i) => String(i.date).startsWith(month)).reduce((s, i) => s + Number(i.amount), 0)
+  const monthIncome   = incomes.filter((i) => String(i.date).startsWith(month) && i.category !== 'הון עצמי' && i.category !== 'התאמה').reduce((s, i) => s + Number(i.amount), 0)
   const monthExpenses = expenses.filter((e) => String(e.date).startsWith(month)).reduce((s, e) => s + Number(e.amount), 0)
   const profit        = monthIncome - monthExpenses
 
@@ -247,12 +254,14 @@ async function processMessage(text) {
     const source = detectSource(t)
     const qty = extractQuantity(t)
 
+    const buyer = extractBuyer(t)
     await fsAdd('income', {
       amount: amount * qty,
       description: t,
       date,
       category: 'מכירת מוצרים',
       source,
+      buyer,
     })
 
     const sourceLabel = source === 'shopify' ? ' (שופיפי)' : source === 'popup' ? ' (פופאפ)' : ''
