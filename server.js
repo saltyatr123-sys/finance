@@ -11,11 +11,41 @@ const PROJECT_ID = 'salty-finance'
 const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`
 
 // ── Firestore helpers ─────────────────────────────────────────────────────────
+
+// Handles stringValue, doubleValue, integerValue, booleanValue, arrayValue, mapValue
+function extractValue(v) {
+  if (!v) return null
+  if ('stringValue'  in v) return v.stringValue
+  if ('doubleValue'  in v) return v.doubleValue
+  if ('integerValue' in v) return Number(v.integerValue)
+  if ('booleanValue' in v) return v.booleanValue
+  if ('arrayValue'   in v) {
+    return (v.arrayValue.values || []).map((item) => {
+      if ('mapValue' in item) {
+        const obj = {}
+        for (const [k, vv] of Object.entries(item.mapValue.fields || {})) {
+          obj[k] = extractValue(vv)
+        }
+        return obj
+      }
+      return extractValue(item)
+    })
+  }
+  if ('mapValue' in v) {
+    const obj = {}
+    for (const [k, vv] of Object.entries(v.mapValue.fields || {})) {
+      obj[k] = extractValue(vv)
+    }
+    return obj
+  }
+  return null
+}
+
 function toFirestoreFields(obj) {
   const fields = {}
   for (const [k, v] of Object.entries(obj)) {
-    if (typeof v === 'number')  fields[k] = { doubleValue: v }
-    else                        fields[k] = { stringValue: String(v) }
+    if (typeof v === 'number') fields[k] = { doubleValue: v }
+    else                       fields[k] = { stringValue: String(v) }
   }
   return fields
 }
@@ -35,7 +65,7 @@ async function fsGet(col) {
   return (json.documents || []).map((d) => {
     const out = { _id: d.name.split('/').pop() }
     for (const [k, v] of Object.entries(d.fields || {})) {
-      out[k] = v.doubleValue ?? v.stringValue ?? v.integerValue ?? null
+      out[k] = extractValue(v)
     }
     return out
   })
@@ -54,16 +84,23 @@ async function fsPatch(col, docId, data) {
   return res.json()
 }
 
+// Parse sizes whether stored as JSON string or native array
+function parseSizes(raw) {
+  if (Array.isArray(raw)) return raw
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw) } catch { return [] }
+  }
+  return []
+}
+
 // ── Message parser ────────────────────────────────────────────────────────────
 
-// Returns the LAST number (most likely the price, not quantity)
 function extractAmount(text) {
   const matches = [...text.matchAll(/\d+(\.\d+)?/g)]
   if (!matches.length) return null
   return parseFloat(matches[matches.length - 1][0])
 }
 
-// Returns the FIRST number if there are 2+ numbers (likely quantity)
 function extractQuantity(text) {
   const matches = [...text.matchAll(/\d+/g)]
   return matches.length >= 2 ? parseInt(matches[0][0]) : 1
@@ -87,16 +124,20 @@ function detectType(text) {
 }
 
 function detectSource(text) {
-  if (/שופיפ/.test(text)) return 'shopify'
-  if (/פופ.?אפ|popup/.test(text)) return 'popup'
+  if (/שופיפ/.test(text))          return 'shopify'
+  if (/פופ.?אפ|popup/.test(text))  return 'popup'
+  if (/ביט|bit/i.test(text))       return 'bit'
+  if (/מזומן|cash/i.test(text))    return 'cash'
+  if (/העברה|בנק/.test(text))      return 'bank'
   return 'other'
 }
 
 // ── Inventory matching ────────────────────────────────────────────────────────
+
 function detectProductType(text) {
-  if (/חולצ/.test(text)) return 'חולצ'
+  if (/חולצ/.test(text))           return 'חולצ'
   if (/סוודר|סווד|פוטר/.test(text)) return 'פוטר'
-  if (/מכנס/.test(text)) return 'מכנס'
+  if (/מכנס/.test(text))           return 'מכנס'
   return null
 }
 
@@ -106,15 +147,14 @@ function detectSize(text) {
 }
 
 function extractBuyer(text) {
-  // "מכרתי חולצה M לכרמל 150" → "כרמל"
   const match = text.match(/ל([א-ת]{2,10})(?:\s|$)/)
   return match ? match[1] : ''
 }
 
 function detectColorHint(text) {
   if (/נייבי|נייווי/.test(text)) return 'נייבי'
-  if (/חום/.test(text)) return 'חום'
-  if (/קהה/.test(text)) return 'קהה'
+  if (/חום/.test(text))           return 'חום'
+  if (/קהה/.test(text))           return 'קהה'
   return null
 }
 
@@ -133,13 +173,10 @@ async function findInventoryProduct(text) {
   }
   if (!candidates.length) return { product: null, size }
 
-  // Prefer product with stock in that size (for sales)
   if (size) {
     const withStock = candidates.filter((item) => {
-      try {
-        const sizes = JSON.parse(item.sizes || '[]')
-        return sizes.some((s) => s.size === size && s.stock > 0)
-      } catch { return false }
+      const sizes = parseSizes(item.sizes)
+      return sizes.some((s) => s.size === size && s.stock > 0)
     })
     return { product: withStock.length ? withStock[0] : candidates[0], size }
   }
@@ -147,53 +184,45 @@ async function findInventoryProduct(text) {
   return { product: candidates[0], size: null }
 }
 
-async function updateInventoryOnSale(text, amount, qty) {
-  const { product, size } = await findInventoryProduct(text)
+// Decrement inventory stock and optionally update sellPrice
+async function decrementInventory(product, size, sellPrice, qty) {
   if (!product || !size) return null
+  const sizes = parseSizes(product.sizes)
+  const idx = sizes.findIndex((s) => s.size === size)
+  if (idx === -1) return null
 
-  let sizes
-  try { sizes = JSON.parse(product.sizes || '[]') } catch { return null }
-
-  const sizeIdx = sizes.findIndex((s) => s.size === size)
-  if (sizeIdx === -1) return null
-
-  sizes[sizeIdx].sellPrice = amount
-  sizes[sizeIdx].stock = Math.max(0, sizes[sizeIdx].stock - qty)
+  if (sellPrice > 0) sizes[idx].sellPrice = sellPrice
+  sizes[idx].stock = Math.max(0, sizes[idx].stock - qty)
 
   await fsPatch('inventory', product._id, { sizes: JSON.stringify(sizes) })
-
-  return { name: product.name, size, newStock: sizes[sizeIdx].stock }
+  return { name: product.name, size, newStock: sizes[idx].stock }
 }
 
-async function updateInventoryOnPurchase(text, qty) {
-  const { product, size } = await findInventoryProduct(text)
+// Increment inventory stock on purchase
+async function incrementInventory(product, size, qty) {
   if (!product || !size) return null
+  const sizes = parseSizes(product.sizes)
+  const idx = sizes.findIndex((s) => s.size === size)
+  if (idx === -1) return null
 
-  let sizes
-  try { sizes = JSON.parse(product.sizes || '[]') } catch { return null }
-
-  const sizeIdx = sizes.findIndex((s) => s.size === size)
-  if (sizeIdx === -1) return null
-
-  sizes[sizeIdx].stock += qty
+  sizes[idx].stock += qty
 
   await fsPatch('inventory', product._id, { sizes: JSON.stringify(sizes) })
-
-  return { name: product.name, size, newStock: sizes[sizeIdx].stock }
+  return { name: product.name, size, newStock: sizes[idx].stock }
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
+
 async function cmdInventory() {
   const items = await fsGet('inventory')
   if (!items.length) return '📦 אין מוצרים במלאי עדיין.'
   let msg = '📦 *מלאי נוכחי:*\n\n'
   for (const item of items) {
-    if (!item.sizes) continue
-    let sizes
-    try { sizes = JSON.parse(item.sizes) } catch { continue }
+    const sizes = parseSizes(item.sizes)
+    if (!sizes.length) continue
     const lines = sizes.map((s) => `${s.size}: ${s.stock} יח'`).join(' | ')
-    const totalStock = sizes.reduce((sum, s) => sum + s.stock, 0)
-    msg += `*${item.name}*\n${lines}\nסה"כ: ${totalStock} יח'\n\n`
+    const total = sizes.reduce((sum, s) => sum + (s.stock || 0), 0)
+    msg += `*${item.name}*\n${lines}\nסה"כ: ${total} יח'\n\n`
   }
   return msg.trim()
 }
@@ -202,9 +231,14 @@ async function cmdReport() {
   const month = thisMonth()
   const [incomes, expenses] = await Promise.all([fsGet('income'), fsGet('expenses')])
 
-  const monthIncome   = incomes.filter((i) => String(i.date).startsWith(month) && i.category !== 'הון עצמי' && i.category !== 'התאמה').reduce((s, i) => s + Number(i.amount), 0)
-  const monthExpenses = expenses.filter((e) => String(e.date).startsWith(month)).reduce((s, e) => s + Number(e.amount), 0)
-  const profit        = monthIncome - monthExpenses
+  const SKIP = ['הון עצמי', 'התאמה']
+  const monthIncome   = incomes
+    .filter((i) => String(i.date).startsWith(month) && !SKIP.includes(i.category))
+    .reduce((s, i) => s + Number(i.amount), 0)
+  const monthExpenses = expenses
+    .filter((e) => String(e.date).startsWith(month))
+    .reduce((s, e) => s + Number(e.amount), 0)
+  const profit = monthIncome - monthExpenses
 
   const monthHe = new Date().toLocaleString('he-IL', { month: 'long', year: 'numeric', timeZone: 'Asia/Jerusalem' })
 
@@ -220,7 +254,7 @@ async function cmdReport() {
 function cmdHelp() {
   return (
     `🧂 *Salty Bot — פקודות:*\n\n` +
-    `*הכנסה:*\n"מכרתי חולצה M 150"\n"מכרתי סוודר L 200"\n"קיבלתי 200 פופאפ"\n\n` +
+    `*הכנסה:*\n"מכרתי חולצה M 150"\n"מכרתי סוודר L לטל 200"\n"קיבלתי 200 ביט"\n\n` +
     `*כמות:*\n"מכרתי 2 חולצות M 150" (2 יחידות)\n\n` +
     `*הוצאה:*\n"שילמתי שופיפי 90"\n"קניתי מלאי 500"\n\n` +
     `*פקודות מהירות:*\n📦 *מלאי* — סיכום מלאי\n📊 *דוח* — סיכום החודש\n❓ *עזרה* — ההודעה הזו`
@@ -228,12 +262,13 @@ function cmdHelp() {
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
+
 async function processMessage(text) {
   const t = text.trim()
 
-  if (t === 'מלאי')                          return cmdInventory()
-  if (t === 'דוח')                           return cmdReport()
-  if (['עזרה', '?', 'help'].includes(t))     return cmdHelp()
+  if (t === 'מלאי')                      return cmdInventory()
+  if (t === 'דוח')                       return cmdReport()
+  if (['עזרה', '?', 'help'].includes(t)) return cmdHelp()
 
   const amount = extractAmount(t)
   if (!amount) {
@@ -252,9 +287,13 @@ async function processMessage(text) {
 
   if (type === 'income') {
     const source = detectSource(t)
-    const qty = extractQuantity(t)
+    const qty    = extractQuantity(t)
+    const buyer  = extractBuyer(t)
 
-    const buyer = extractBuyer(t)
+    // Find product first so we can include in the income entry
+    const { product, size } = await findInventoryProduct(t)
+    const productName = product?.name || ''
+
     await fsAdd('income', {
       amount: amount * qty,
       description: t,
@@ -262,15 +301,17 @@ async function processMessage(text) {
       category: 'מכירת מוצרים',
       source,
       buyer,
+      product: productName,
+      size: size || '',
     })
 
-    const sourceLabel = source === 'shopify' ? ' (שופיפי)' : source === 'popup' ? ' (פופאפ)' : ''
-    let reply = `✅ *נרשמה הכנסה${sourceLabel}*\n₪${(amount * qty).toLocaleString()} — ${date}`
+    const srcHe = { shopify: 'שופיפי', popup: 'פופאפ', bit: 'ביט', cash: 'מזומן', bank: 'העברה' }[source] || ''
+    let reply = `✅ *נרשמה הכנסה${srcHe ? ' (' + srcHe + ')' : ''}*\n₪${(amount * qty).toLocaleString()} — ${date}`
     if (qty > 1) reply += ` (${qty} יח' × ₪${amount})`
+    if (buyer)   reply += `\nקונה: ${buyer}`
     reply += `\n"${t}"`
 
-    // Update inventory: set sellPrice + decrease stock
-    const invUpdate = await updateInventoryOnSale(t, amount, qty)
+    const invUpdate = await decrementInventory(product, size, amount, qty)
     if (invUpdate) {
       reply += `\n\n📦 *מלאי עודכן:*\n${invUpdate.name} ${invUpdate.size} → נשארו ${invUpdate.newStock} יח'`
     }
@@ -279,10 +320,10 @@ async function processMessage(text) {
   }
 
   if (type === 'expense') {
-    const category = /שופיפ/.test(t) ? 'עמלות שופיפי'
-      : /פרסו|מטא|meta|אינסטה|טיקטוק/.test(t) ? 'שיווק ופרסום'
-      : /ספק|מלאי|חולצ|סוודר/.test(t) ? 'רכישת מלאי'
-      : /משלוח/.test(t) ? 'משלוחים'
+    const category = /שופיפ/.test(t)              ? 'עמלות שופיפי'
+      : /פרסו|מטא|meta|אינסטה|טיקטוק/.test(t)   ? 'שיווק ופרסום'
+      : /ספק|מלאי|חולצ|סוודר|מכנס/.test(t)      ? 'רכישת מלאי'
+      : /משלוח/.test(t)                            ? 'משלוחים'
       : 'אחר'
 
     const qty = extractQuantity(t)
@@ -296,9 +337,9 @@ async function processMessage(text) {
 
     let reply = `✅ *נרשמה הוצאה*\n₪${amount.toLocaleString()} — ${date}\nקטגוריה: ${category}\n"${t}"`
 
-    // If it's an inventory purchase, update stock
     if (category === 'רכישת מלאי') {
-      const invUpdate = await updateInventoryOnPurchase(t, qty)
+      const { product, size } = await findInventoryProduct(t)
+      const invUpdate = await incrementInventory(product, size, qty)
       if (invUpdate) {
         reply += `\n\n📦 *מלאי עודכן:*\n${invUpdate.name} ${invUpdate.size} → נשארו ${invUpdate.newStock} יח'`
       }
@@ -309,6 +350,7 @@ async function processMessage(text) {
 }
 
 // ── Route ─────────────────────────────────────────────────────────────────────
+
 app.post('/whatsapp', async (req, res) => {
   const text = req.body.Body || ''
   let reply
@@ -326,6 +368,7 @@ app.post('/whatsapp', async (req, res) => {
 })
 
 // ── Shopify webhook ───────────────────────────────────────────────────────────
+
 app.post('/shopify-order', async (req, res) => {
   res.sendStatus(200) // respond immediately so Shopify doesn't retry
 
@@ -337,12 +380,28 @@ app.post('/shopify-order', async (req, res) => {
     if (!amount) return
 
     const orderNumber = order.order_number || order.name || 'ללא מספר'
-    const items = (order.line_items || [])
-      .map((i) => `${i.name} x${i.quantity}`)
-      .join(', ')
-    const description = `הזמנה #${orderNumber}${items ? ' — ' + items : ''}`
+    const lineItems   = order.line_items || []
+    const date        = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Jerusalem' }).slice(0, 10)
 
-    const date = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Jerusalem' }).slice(0, 10)
+    // Extract buyer name
+    const buyer = [order.customer?.first_name, order.customer?.last_name]
+      .filter(Boolean).join(' ') || order.billing_address?.name || ''
+
+    // Build description
+    const itemsText  = lineItems.map((i) => `${i.name} x${i.quantity}`).join(', ')
+    const description = `הזמנה #${orderNumber}${itemsText ? ' — ' + itemsText : ''}`
+
+    // Get primary product info for the income entry
+    let primaryProduct = ''
+    let primarySize    = ''
+    if (lineItems.length > 0) {
+      const first    = lineItems[0]
+      const itemText = first.name || first.product_title || ''
+      const size     = first.variant_title?.split('/')?.[0]?.trim() || detectSize(itemText) || ''
+      const { product } = await findInventoryProduct(itemText + (size ? ' ' + size : ''))
+      primaryProduct = product?.name || first.product_title || itemText.split(' - ')[0]
+      primarySize    = size
+    }
 
     await fsAdd('income', {
       amount,
@@ -350,9 +409,27 @@ app.post('/shopify-order', async (req, res) => {
       date,
       category: 'מכירת מוצרים',
       source: 'shopify',
+      buyer,
+      product: primaryProduct,
+      size: primarySize,
     })
 
-    console.log(`Shopify order logged: #${orderNumber} ₪${amount}`)
+    // Decrement inventory for EACH line item
+    for (const item of lineItems) {
+      const itemText = item.name || item.product_title || ''
+      const size     = item.variant_title?.split('/')?.[0]?.trim() || detectSize(itemText)
+      const qty      = item.quantity || 1
+      const price    = parseFloat(item.price || 0)
+
+      if (!size) continue
+      const { product } = await findInventoryProduct(itemText + ' ' + size)
+      const inv = await decrementInventory(product, size, price, qty)
+      if (inv) {
+        console.log(`  📦 ${inv.name} ${inv.size} → ${inv.newStock} נשארו`)
+      }
+    }
+
+    console.log(`Shopify הזמנה #${orderNumber} נרשמה: ₪${amount} — ${buyer}`)
   } catch (err) {
     console.error('Shopify webhook error:', err)
   }
